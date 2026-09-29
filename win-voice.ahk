@@ -4,9 +4,9 @@ SendMode "Input"
 SetWorkingDir A_ScriptDir
 
 ; ============================================================
-; win-voice.ahk v14 — Alt+1 text-to-speech
+; win-voice.ahk v16 — Alt+1 text-to-speech
 ; Supports: Edge, Chrome, Notepad, Notepad++
-; Reads selected text only. Proven clipboard approach from v8.
+; Reads selected text only. Clipboard capture for all apps.
 ; ============================================================
 
 LOG_FILE := A_ScriptDir . "\ahk_debug.log"
@@ -21,23 +21,23 @@ WriteLog(msg) {
     WriteLog("=== Hotkey pressed ===")
 
     procName := WinGetProcessName("A")
-    WriteLog("Active process: " . procName)
+    WriteLog("Active process: [" . procName . "]")
 
-    ; Map exe name to app identifier expected by Python
-    appMap := Map(
-        "msedge.exe", "edge",
-        "chrome.exe", "chrome",
-        "notepad.exe", "notepad",
-        "notepad++.exe", "notepad++"
-    )
-
-    if (!appMap.Has(procName)) {
+    ; Case-insensitive regex matching for process names
+    if (procName ~= "i)^msedge\.exe$") {
+        appName := "edge"
+    } else if (procName ~= "i)^chrome\.exe$") {
+        appName := "chrome"
+    } else if (procName ~= "i)^notepad\.exe$") {
+        appName := "notepad"
+    } else if (procName ~= "i)^notepad\+\+\.exe$") {
+        appName := "notepad++"
+    } else {
         TrayTip "Alt-1 pressed but no supported app is active", "win-voice"
-        WriteLog("Unsupported app, exiting.")
+        WriteLog("Unsupported app: [" . procName . "], exiting.")
         return
     }
 
-    appName := appMap[procName]
     hwnd := WinGetID("A")
     WriteLog("App=" . appName . " HWND=" . hwnd)
 
@@ -55,35 +55,17 @@ WriteLog(msg) {
         return
     }
 
-    ; Always clean up old selection file first
+    ; ---- Capture selection via clipboard (works for all apps) ----
     selectionFile := A_Temp . "\win_voice_selection.txt"
     if (FileExist(selectionFile)) {
         FileDelete(selectionFile)
-        WriteLog("Deleted old selection file.")
     }
 
-    ; ---- Notepad++: use Scintilla API, skip clipboard ----
-    if (appName == "notepad++") {
-        cmd := Format('"{1}" "{2}" --app notepad++ --hwnd {3}', pythonExe, scriptPath, hwnd)
-        WriteLog("Notepad++ cmd: " . cmd)
-        exitCode := RunWait(cmd,, "Hide")
-        WriteLog("Notepad++ exit code: " . exitCode)
-        if (exitCode == 3) {
-            TrayTip "No text selected. Please select text and press Alt+1.", "win-voice"
-        } else if (exitCode == 2) {
-            TrayTip "Could not read text. Please select text and press Alt+1.", "win-voice"
-        } else if (exitCode != 0) {
-            TrayTip "An error occurred. Check win_voice.log for details.", "win-voice"
-        }
-        return
-    }
-
-    ; ---- All other apps: proven clipboard selection capture ----
     ClipSaved := ClipboardAll()
     A_Clipboard := ""
-    Sleep(50)
+    Sleep(100)
     Send("^c")
-    clipAvailable := ClipWait(0.5, 1)
+    clipAvailable := ClipWait(0.8, 1)
 
     hasText := (clipAvailable && A_Clipboard != "")
     WriteLog("ClipWait result: " . clipAvailable . "  HasText: " . hasText . "  Len: " . StrLen(A_Clipboard))
@@ -96,10 +78,9 @@ WriteLog(msg) {
     A_Clipboard := ClipSaved
     ClipSaved := ""
 
+    cmd := Format('"{1}" "{2}" --app {3} --hwnd {4}', pythonExe, scriptPath, appName, hwnd)
     if (hasText) {
-        cmd := Format('"{1}" "{2}" --app {3} --hwnd {4} --selection-file "{5}"', pythonExe, scriptPath, appName, hwnd, selectionFile)
-    } else {
-        cmd := Format('"{1}" "{2}" --app {3} --hwnd {4}', pythonExe, scriptPath, appName, hwnd)
+        cmd .= Format(' --selection-file "{1}"', selectionFile)
     }
     WriteLog("Cmd: " . cmd)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-win_voice.py v9
+win_voice.py v10
 Read aloud selected text from Edge, Chrome, Notepad, and Notepad++.
 Uses Piper TTS + sounddevice for direct PCM streaming.
 """
@@ -314,14 +314,9 @@ def get_notepad_selection(hwnd: int) -> str:
 # Notepad++: Scintilla API via SendMessage
 # ============================================================
 # Scintilla constants
-SCI_GETSELECTIONS = 2579
 SCI_GETSELTEXT = 2161
 SCI_GETCURRENTPOS = 2008
 SCI_GETANCHOR = 2009
-SCI_GETLENGTH = 2006
-SCI_GETTEXT = 2182
-
-WM_USER = 1024
 
 
 def send_message(hwnd: int, msg: int, wparam: int = 0, lparam: int = 0) -> int:
@@ -333,52 +328,51 @@ def get_notepad_plus_plus_selection(hwnd: int) -> str:
     """
     Uses Scintilla API via SendMessage.
     hwnd is the main Notepad++ window handle.
-    We find the Scintilla editor child window first.
+    We find ALL Scintilla editor child windows and pick the one with a selection.
     """
     logger.info("Connecting to Notepad++ window HWND=%d", hwnd)
 
     EnumChildWindows = ctypes.windll.user32.EnumChildWindows
-
-    found_hwnd = ctypes.c_long(0)
+    scintilla_hwnds = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_long, ctypes.c_long)
     def enum_child_callback(child_hwnd, extra):
-        nonlocal found_hwnd
         class_name = ctypes.create_unicode_buffer(256)
         ctypes.windll.user32.GetClassNameW(child_hwnd, class_name, 256)
-        if class_name.value == "Scintilla":
-            found_hwnd.value = child_hwnd
-            return False  # stop enumerating
+        cn = class_name.value
+        if cn == "Scintilla":
+            scintilla_hwnds.append(child_hwnd)
         return True
 
     EnumChildWindows(hwnd, enum_child_callback, 0)
+    logger.info("Found %d Scintilla window(s).", len(scintilla_hwnds))
 
-    if found_hwnd.value == 0:
+    if not scintilla_hwnds:
         raise RuntimeError("No Scintilla editor window found in Notepad++.")
 
-    sci_hwnd = found_hwnd.value
-    logger.info("Found Scintilla editor HWND=%d", sci_hwnd)
+    # Try each Scintilla window; pick the one with a real selection.
+    for sci_hwnd in scintilla_hwnds:
+        anchor = send_message(sci_hwnd, SCI_GETANCHOR, 0, 0)
+        current_pos = send_message(sci_hwnd, SCI_GETCURRENTPOS, 0, 0)
+        logger.info("Scintilla HWND=%d anchor=%d current_pos=%d", sci_hwnd, anchor, current_pos)
 
-    # Check if there is a real selection (anchor != current pos)
-    anchor = send_message(sci_hwnd, SCI_GETANCHOR, 0, 0)
-    current_pos = send_message(sci_hwnd, SCI_GETCURRENTPOS, 0, 0)
-    logger.info("anchor=%d current_pos=%d", anchor, current_pos)
+        if anchor == current_pos:
+            logger.info("  -> no selection on this view.")
+            continue
 
-    if anchor == current_pos:
-        logger.info("No selection detected (anchor == current_pos).")
-        return ""
+        sel_len = send_message(sci_hwnd, SCI_GETSELTEXT, 0, 0)
+        if sel_len <= 1:
+            logger.info("  -> selection too small: %d", sel_len)
+            continue
 
-    # Get selection text
-    sel_len = send_message(sci_hwnd, SCI_GETSELTEXT, 0, 0)
-    if sel_len <= 1:  # includes null terminator
-        logger.info("Selection length too small: %d", sel_len)
-        return ""
+        buf = ctypes.create_string_buffer(sel_len)
+        send_message(sci_hwnd, SCI_GETSELTEXT, 0, ctypes.addressof(buf))
+        text = buf.raw[:sel_len - 1].decode("utf-8", errors="replace")
+        logger.info("Notepad++ selection: %d chars", len(text))
+        return clean_text(text)
 
-    buf = ctypes.create_string_buffer(sel_len)
-    send_message(sci_hwnd, SCI_GETSELTEXT, 0, ctypes.addressof(buf))
-    text = buf.raw[:sel_len - 1].decode("utf-8", errors="replace")
-    logger.info("Notepad++ selection: %d chars", len(text))
-    return clean_text(text)
+    logger.info("No selection found in any Scintilla view.")
+    return ""
 
 
 # ============================================================
