@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 # ============================================================
-# Logging FIRST — before any imports that might fail
+# Logging FIRST
 # ============================================================
 APP_DIR = Path(r"C:\Users\myuser\Apps\win-voice")
 LOG_FILE = APP_DIR / "win_voice.log"
@@ -39,7 +39,6 @@ try:
     import json
     import re
     import subprocess
-    import tempfile
     import time
     import urllib.parse
     import urllib.request
@@ -50,7 +49,6 @@ try:
     import requests
     import sounddevice as sd
     import uiautomation as uia
-    from pypdf import PdfReader
     logger.info("All imports successful.")
 except Exception as import_exc:
     logger.exception("IMPORT FAILURE: %s", import_exc)
@@ -62,16 +60,15 @@ except Exception as import_exc:
 # ============================================================
 PIPER_EXE = Path(r"C:\Users\myuser\AppData\Roaming\Python\Python314\Scripts\piper")
 VOICE_PATH = Path(r"C:\Users\myuser\pipervoices\en_US-lessac-medium.onnx")
-VOICE_JSON = Path(str(VOICE_PATH) + ".json")  # FIXED: was .onnx.json which duplicated the extension
+VOICE_JSON = Path(str(VOICE_PATH) + ".json")
 
-HARD_LIMIT_BYTES = 50 * 1024  # 50 KB raw limit
+HARD_LIMIT_BYTES = 50 * 1024  # 50 KB raw limit for webpages
 MAX_CHARS = 20000
 
 # ============================================================
 # Stop toggle
 # ============================================================
 def stop_if_running() -> bool:
-    """If another instance is playing, signal it to stop and return True."""
     if not PID_FILE.exists():
         return False
     try:
@@ -102,7 +99,6 @@ def get_sample_rate() -> int:
 
 
 def speak_text(text: str) -> None:
-    """Stream Piper raw PCM through sounddevice."""
     try:
         sample_rate = get_sample_rate()
     except Exception as exc:
@@ -213,20 +209,64 @@ def get_edge_url(hwnd: int) -> str | None:
             return None
 
         address_bar = None
-        for ctrl, _ in uia.WalkTree(window):
-            if ctrl.AutomationId in ("view_1002", "AddressBar", "addressEdit"):
-                address_bar = ctrl
-                break
-            if ctrl.Name in (
-                "Address and search bar",
-                "アドレスと検索バー",
-                "地址和搜索栏",
-            ) and ctrl.ControlTypeName in ("EditControl", "DocumentControl"):
-                address_bar = ctrl
-                break
+
+        def find_by_id(control, ids, max_depth=6, depth=0):
+            if depth > max_depth:
+                return None
+            for child in control.GetChildren():
+                if child.AutomationId in ids:
+                    return child
+                result = find_by_id(child, ids, max_depth, depth + 1)
+                if result:
+                    return result
+            return None
+
+        address_bar = find_by_id(window, ("view_1002", "AddressBar", "addressEdit"))
+        if address_bar:
+            logger.info("Found address bar by AutomationId=%s", address_bar.AutomationId)
+
+        if not address_bar:
+            def find_by_name(control, max_depth=6, depth=0):
+                if depth > max_depth:
+                    return None
+                for child in control.GetChildren():
+                    if child.ControlTypeName in ("EditControl", "DocumentControl"):
+                        name = child.Name or ""
+                        if any(k in name for k in ("Address", "アドレス", "地址", "search", "検索", "搜索")):
+                            return child
+                    result = find_by_name(child, max_depth, depth + 1)
+                    if result:
+                        return result
+                return None
+
+            address_bar = find_by_name(window)
+            if address_bar:
+                logger.info("Found address bar by Name=%s", address_bar.Name)
+
+        if not address_bar:
+            def find_by_url_value(control, max_depth=6, depth=0):
+                if depth > max_depth:
+                    return None
+                for child in control.GetChildren():
+                    if child.ControlTypeName == "EditControl":
+                        val_pat = child.GetValuePattern()
+                        if val_pat:
+                            val = val_pat.Value or ""
+                            if val.startswith("http") or val.startswith("file:") or "://" in val:
+                                return child
+                    result = find_by_url_value(child, max_depth, depth + 1)
+                    if result:
+                        return result
+                return None
+
+            address_bar = find_by_url_value(window)
+            if address_bar:
+                logger.info("Found address bar by URL-like value")
 
         if not address_bar:
             logger.error("Could not find Edge address bar in UIA tree.")
+            for child in window.GetChildren():
+                logger.debug("  child: type=%s name=%s id=%s", child.ControlTypeName, child.Name, child.AutomationId)
             return None
 
         val_pat = address_bar.GetValuePattern()
@@ -238,8 +278,30 @@ def get_edge_url(hwnd: int) -> str | None:
         return None
 
 
-def fetch_bytes(url: str, limit: int = HARD_LIMIT_BYTES) -> bytes:
-    logger.info("Fetching up to %d bytes from %s", limit, url)
+def is_pdf_url(url: str) -> bool:
+    """Detect PDF from URL suffix or HEAD request without downloading body."""
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith(".pdf"):
+        logger.info("PDF detected by URL suffix: %s", url)
+        return True
+
+    # For HTTP(S), try a HEAD request to check Content-Type
+    if parsed.scheme in ("http", "https"):
+        try:
+            resp = requests.head(url, timeout=5, allow_redirects=True)
+            ct = resp.headers.get("Content-Type", "").lower()
+            if "pdf" in ct:
+                logger.info("PDF detected by Content-Type: %s", ct)
+                return True
+        except Exception as exc:
+            logger.debug("HEAD request failed (%s); assuming not PDF.", exc)
+    return False
+
+
+def fetch_webpage_text(url: str) -> str:
+    """Fetch up to 50KB of raw HTML and convert to plain text."""
+    logger.info("Fetching webpage up to %d bytes from %s", HARD_LIMIT_BYTES, url)
     parsed = urllib.parse.urlparse(url)
 
     if parsed.scheme in ("http", "https"):
@@ -255,59 +317,21 @@ def fetch_bytes(url: str, limit: int = HARD_LIMIT_BYTES) -> bytes:
         data = b""
         for chunk in resp.iter_content(chunk_size=8192):
             data += chunk
-            if len(data) >= limit:
+            if len(data) >= HARD_LIMIT_BYTES:
                 break
-        return data[:limit]
-
-    if parsed.scheme == "file":
+        data = data[:HARD_LIMIT_BYTES]
+    elif parsed.scheme == "file":
         path = urllib.request.url2pathname(parsed.path)
         with open(path, "rb") as f:
-            return f.read(limit)
-
-    if os.path.exists(url):
+            data = f.read(HARD_LIMIT_BYTES)
+    elif os.path.exists(url):
         with open(url, "rb") as f:
-            return f.read(limit)
+            data = f.read(HARD_LIMIT_BYTES)
+    else:
+        raise ValueError(f"Unsupported URL scheme or missing file: {url}")
 
-    raise ValueError(f"Unsupported URL scheme or missing file: {url}")
-
-
-def extract_pdf_first_page_text(data: bytes) -> str | None:
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        reader = PdfReader(tmp_path)
-        if len(reader.pages) == 0:
-            return None
-        text = reader.pages[0].extract_text()
-        if text and text.strip():
-            return text.strip()
-        return None
-    except Exception as exc:
-        logger.warning("PDF extraction failed: %s", exc)
-        return None
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-
-def extract_text_from_url(url: str) -> str:
-    data = fetch_bytes(url)
     if not data:
         return ""
-
-    is_pdf = data.startswith(b"%PDF") or url.lower().endswith(".pdf")
-
-    if is_pdf:
-        text = extract_pdf_first_page_text(data)
-        if text is None:
-            logger.info("PDF first page has no extractable text; skipping.")
-            return ""
-        return clean_text(text)
 
     try:
         html_str = data.decode("utf-8", errors="replace")
@@ -318,6 +342,7 @@ def extract_text_from_url(url: str) -> str:
     extractor.feed(html_str)
     text = extractor.get_text()
     return clean_text(text)
+
 
 # ============================================================
 # Main
@@ -343,8 +368,19 @@ def main():
         if not url:
             logger.error("Could not determine Edge URL; aborting.")
             return
-        text = extract_text_from_url(url)
-        logger.info("Page/PDF mode: %d chars from %s", len(text), url)
+
+        if is_pdf_url(url):
+            logger.info("PDF detected in page mode. Prompting user to select text.")
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "PDF detected.\n\nPlease select the text you want to read and press Alt+1.",
+                "win-voice",
+                0x40  # MB_ICONINFORMATION
+            )
+            return
+
+        text = fetch_webpage_text(url)
+        logger.info("Page mode: %d chars from %s", len(text), url)
     else:
         logger.error("No selection file and no HWND provided.")
         return
