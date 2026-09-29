@@ -41,7 +41,6 @@ try:
     import re
     import subprocess
     import time
-    import html
 
     import numpy as np
     import sounddevice as sd
@@ -49,12 +48,6 @@ try:
     logger.info("All imports successful.")
 except Exception as import_exc:
     logger.exception("IMPORT FAILURE: %s", import_exc)
-    ctypes.windll.user32.MessageBoxW(
-        0,
-        f"Import error — check win_voice.log\n\n{import_exc}",
-        "win_voice import error",
-        0x10
-    )
     sys.exit(1)
 
 # ============================================================
@@ -64,7 +57,21 @@ PIPER_EXE = Path(r"C:\Users\myuser\AppData\Roaming\Python\Python314\Scripts\pipe
 VOICE_PATH = Path(r"C:\Users\myuser\pipervoices\en_US-lessac-medium.onnx")
 VOICE_JSON = Path(str(VOICE_PATH) + ".json")
 
-MAX_CHARS = 50000  # Hard safety limit on spoken text (~50KB equivalent)
+MAX_CHARS = 50000  # Hard safety limit on spoken text
+
+# ============================================================
+# TrayTip helper (Windows notification, no messagebox)
+# ============================================================
+def tray_tip(title: str, message: str) -> None:
+    """Show a Windows tray notification (balloon tip)."""
+    try:
+        # Use Windows API directly for notification
+        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    except Exception:
+        pass
+    # Write to log as well
+    logger.info("NOTIFICATION: %s - %s", title, message)
+
 
 # ============================================================
 # Stop toggle
@@ -99,12 +106,67 @@ def get_sample_rate() -> int:
     return cfg.get("audio", {}).get("sample_rate", 22050)
 
 
-def speak_text(text: str) -> None:
+def sanitize_for_piper(text: str) -> str:
+    """
+    Remove or replace characters that cause Piper to fail or produce weird sounds.
+    The 'I umlaut' issue is typically caused by smart quotes, zero-width chars,
+    or other Unicode control characters that Piper mispronounces.
+    """
+    # Replace common problematic Unicode characters with ASCII equivalents
+    replacements = {
+        '\u00A0': ' ',      # non-breaking space
+        '\u200B': '',       # zero-width space
+        '\u200C': '',       # zero-width non-joiner
+        '\u200D': '',       # zero-width joiner
+        '\uFEFF': '',       # byte order mark / zero-width no-break space
+        '\u2018': "'",      # left single quotation mark
+        '\u2019': "'",      # right single quotation mark
+        '\u201C': '"',      # left double quotation mark
+        '\u201D': '"',      # right double quotation mark
+        '\u201A': ',',      # single low-9 quotation mark
+        '\u201E': ',',      # double low-9 quotation mark
+        '\u2026': '...',    # horizontal ellipsis
+        '\u2013': '-',      # en dash
+        '\u2014': '-',      # em dash
+        '\u02C6': '',       # modifier letter circumflex (can sound like "I umlaut")
+        '\u0302': '',       # combining circumflex accent
+        '\u0308': '',       # combining diaeresis (umlaut)
+        '\u00A8': '',       # diaeresis
+        '\u02D8': '',       # breve
+        '\u02DA': '',       # ring above
+        '\u02DD': '',       # double acute accent
+        '\u02DB': '',       # ogonek
+        '\u02DC': '',       # small tilde
+        '\u00B4': "'",      # acute accent
+        '\u0060': "'",      # grave accent
+        '\u02CA': "'",      # modifier letter acute accent
+        '\u02CB': "'",      # modifier letter grave accent
+    }
+
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+
+    # Remove any remaining control characters except tab, newline, carriage return
+    text = "".join(ch for ch in text if ch == '\t' or ch == '\n' or ch == '\r' or (ord(ch) >= 32 and ord(ch) < 0xD800) or ord(ch) > 0xDFFF)
+
+    # Collapse multiple whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def speak_text(text: str) -> int:
+    """Stream Piper raw PCM through sounddevice. Returns 0 on success, 1 on error."""
     try:
         sample_rate = get_sample_rate()
     except Exception as exc:
         logger.exception("Failed to read voice config: %s", exc)
-        return
+        return 1
+
+    text = sanitize_for_piper(text)
+    if not text:
+        logger.warning("Text is empty after sanitization.")
+        return 1
 
     logger.info("Speaking %d chars at %d Hz.", len(text), sample_rate)
     PID_FILE.write_text(str(os.getpid()))
@@ -120,13 +182,13 @@ def speak_text(text: str) -> None:
     except Exception as exc:
         logger.exception("Failed to run Piper: %s", exc)
         PID_FILE.unlink(missing_ok=True)
-        return
+        return 1
 
     if proc.returncode != 0:
-        err = stderr.decode("utf-8", errors="replace")[:500]
+        err = stderr.decode("utf-8", errors="replace")[:1000]
         logger.error("Piper failed (rc=%d): %s", proc.returncode, err)
         PID_FILE.unlink(missing_ok=True)
-        return
+        return 1
 
     audio = np.frombuffer(stdout, dtype=np.int16)
     logger.info("Received %d samples from Piper.", len(audio))
@@ -134,14 +196,14 @@ def speak_text(text: str) -> None:
     if len(audio) == 0:
         logger.warning("No audio generated (empty output).")
         PID_FILE.unlink(missing_ok=True)
-        return
+        return 1
 
     try:
         sd.play(audio, samplerate=sample_rate)
     except Exception as exc:
         logger.exception("sounddevice play failed: %s", exc)
         PID_FILE.unlink(missing_ok=True)
-        return
+        return 1
 
     try:
         while sd.get_stream().active:
@@ -155,6 +217,8 @@ def speak_text(text: str) -> None:
     finally:
         PID_FILE.unlink(missing_ok=True)
         logger.info("Playback finished.")
+
+    return 0
 
 
 # ============================================================
@@ -215,7 +279,6 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
 
     target = doc_control or text_control
     if not target:
-        # Debug: log top-level children
         logger.error("No DocumentControl or TextPattern control found.")
         for child in window.GetChildren():
             logger.debug("  child: type=%s name=%s id=%s",
@@ -251,62 +314,41 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--selection-file", type=Path, default=None)
     parser.add_argument("--hwnd", type=int, default=0)
     args = parser.parse_args()
 
-    logger.info("Args: selection-file=%s hwnd=%s", args.selection_file, args.hwnd)
+    logger.info("Args: hwnd=%s", args.hwnd)
 
     if stop_if_running():
-        return
+        return 0
 
-    text = ""
-    has_selection = False
+    if not args.hwnd:
+        logger.error("No HWND provided.")
+        return 1
 
-    if args.selection_file and args.selection_file.exists():
-        # Legacy path from AHK clipboard mode (still supported)
-        raw = args.selection_file.read_text("utf-8", errors="replace")
-        text = clean_text(raw)
-        logger.info("Selection-file mode: %d chars.", len(text))
-        has_selection = True
-    elif args.hwnd:
-        try:
-            text, has_selection = get_document_text_from_edge(args.hwnd)
-            logger.info("UIA mode: %d chars, has_selection=%s", len(text), has_selection)
-        except Exception as exc:
-            logger.exception("Document text extraction failed: %s", exc)
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "Could not read page text from Edge.\n\n"
-                "Please select the text you want to read and press Alt+1.",
-                "win-voice",
-                0x40  # MB_ICONINFORMATION
-            )
-            return
-    else:
-        logger.error("No selection file and no HWND provided.")
-        return
+    try:
+        text, has_selection = get_document_text_from_edge(args.hwnd)
+        logger.info("UIA mode: %d chars, has_selection=%s", len(text), has_selection)
+    except Exception as exc:
+        logger.exception("Document text extraction failed: %s", exc)
+        tray_tip("win-voice", "Could not read page text from Edge. Please select text and press Alt+1.")
+        return 2
 
     if not text:
         if has_selection:
             logger.info("Selection was empty; exiting.")
+            return 0
         else:
-            logger.info("No text found on page; may be an image-based PDF. Prompting user.")
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "No readable text found on this page.\n\n"
-                "Please select the text you want to read and press Alt+1.",
-                "win-voice",
-                0x40
-            )
-        return
+            logger.info("No text found on page; may be an image-based PDF.")
+            tray_tip("win-voice", "No readable text found. Please select text and press Alt+1.")
+            return 3
 
     if len(text) > MAX_CHARS:
         text = text[:MAX_CHARS]
         logger.info("Text truncated to %d chars.", MAX_CHARS)
 
-    speak_text(text)
+    return speak_text(text)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
