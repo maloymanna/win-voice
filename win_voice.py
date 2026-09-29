@@ -2,7 +2,7 @@
 """
 win_voice.py
 Direct document text extraction from Edge via UI Automation TextPattern.
-No URL fetching, no address bar detection, no clipboard manipulation.
+No URL fetching, no address bar detection.
 """
 
 import sys
@@ -60,20 +60,6 @@ VOICE_JSON = Path(str(VOICE_PATH) + ".json")
 MAX_CHARS = 50000  # Hard safety limit on spoken text
 
 # ============================================================
-# TrayTip helper (Windows notification, no messagebox)
-# ============================================================
-def tray_tip(title: str, message: str) -> None:
-    """Show a Windows tray notification (balloon tip)."""
-    try:
-        # Use Windows API directly for notification
-        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
-    except Exception:
-        pass
-    # Write to log as well
-    logger.info("NOTIFICATION: %s - %s", title, message)
-
-
-# ============================================================
 # Stop toggle
 # ============================================================
 def stop_if_running() -> bool:
@@ -109,54 +95,47 @@ def get_sample_rate() -> int:
 def sanitize_for_piper(text: str) -> str:
     """
     Remove or replace characters that cause Piper to fail or produce weird sounds.
-    The 'I umlaut' issue is typically caused by smart quotes, zero-width chars,
-    or other Unicode control characters that Piper mispronounces.
     """
-    # Replace common problematic Unicode characters with ASCII equivalents
     replacements = {
-        '\u00A0': ' ',      # non-breaking space
-        '\u200B': '',       # zero-width space
-        '\u200C': '',       # zero-width non-joiner
-        '\u200D': '',       # zero-width joiner
-        '\uFEFF': '',       # byte order mark / zero-width no-break space
-        '\u2018': "'",      # left single quotation mark
-        '\u2019': "'",      # right single quotation mark
-        '\u201C': '"',      # left double quotation mark
-        '\u201D': '"',      # right double quotation mark
-        '\u201A': ',',      # single low-9 quotation mark
-        '\u201E': ',',      # double low-9 quotation mark
-        '\u2026': '...',    # horizontal ellipsis
-        '\u2013': '-',      # en dash
-        '\u2014': '-',      # em dash
-        '\u02C6': '',       # modifier letter circumflex (can sound like "I umlaut")
-        '\u0302': '',       # combining circumflex accent
-        '\u0308': '',       # combining diaeresis (umlaut)
-        '\u00A8': '',       # diaeresis
-        '\u02D8': '',       # breve
-        '\u02DA': '',       # ring above
-        '\u02DD': '',       # double acute accent
-        '\u02DB': '',       # ogonek
-        '\u02DC': '',       # small tilde
-        '\u00B4': "'",      # acute accent
-        '\u0060': "'",      # grave accent
-        '\u02CA': "'",      # modifier letter acute accent
-        '\u02CB': "'",      # modifier letter grave accent
+        '\u00A0': ' ',
+        '\u200B': '',
+        '\u200C': '',
+        '\u200D': '',
+        '\uFEFF': '',
+        '\u2018': "'",
+        '\u2019': "'",
+        '\u201C': '"',
+        '\u201D': '"',
+        '\u201A': ',',
+        '\u201E': ',',
+        '\u2026': '...',
+        '\u2013': '-',
+        '\u2014': '-',
+        '\u02C6': '',
+        '\u0302': '',
+        '\u0308': '',
+        '\u00A8': '',
+        '\u02D8': '',
+        '\u02DA': '',
+        '\u02DD': '',
+        '\u02DB': '',
+        '\u02DC': '',
+        '\u00B4': "'",
+        '\u0060': "'",
+        '\u02CA': "'",
+        '\u02CB': "'",
     }
 
     for bad, good in replacements.items():
         text = text.replace(bad, good)
 
-    # Remove any remaining control characters except tab, newline, carriage return
     text = "".join(ch for ch in text if ch == '\t' or ch == '\n' or ch == '\r' or (ord(ch) >= 32 and ord(ch) < 0xD800) or ord(ch) > 0xDFFF)
-
-    # Collapse multiple whitespace
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
 def speak_text(text: str) -> int:
-    """Stream Piper raw PCM through sounddevice. Returns 0 on success, 1 on error."""
     try:
         sample_rate = get_sample_rate()
     except Exception as exc:
@@ -243,7 +222,6 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
 
     logger.info("Window name=%s class=%s", window.Name, window.ClassName)
 
-    # Strategy 1: Find DocumentControl directly
     doc_control = None
     def find_doc(control, max_depth=8, depth=0):
         nonlocal doc_control
@@ -259,7 +237,6 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
     if doc_control:
         logger.info("Found DocumentControl: name=%s", doc_control.Name)
 
-    # Strategy 2: Find any control that supports TextPattern
     text_control = None
     if not doc_control:
         def find_text_pattern(control, max_depth=8, depth=0):
@@ -289,7 +266,6 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
     if not text_pattern:
         raise RuntimeError("Target control does not expose TextPattern.")
 
-    # Check for selection first
     selections = text_pattern.GetSelection()
     if selections:
         selected_texts = []
@@ -302,7 +278,6 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
             logger.info("Selection detected: %d chars", len(full_selection))
             return clean_text(full_selection), True
 
-    # No selection: get full document text
     doc_range = text_pattern.DocumentRange()
     full_text = doc_range.GetText(MAX_CHARS)
     logger.info("Full document text: %d chars", len(full_text))
@@ -314,25 +289,33 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--selection-file", type=Path, default=None)
     parser.add_argument("--hwnd", type=int, default=0)
     args = parser.parse_args()
 
-    logger.info("Args: hwnd=%s", args.hwnd)
+    logger.info("Args: selection-file=%s hwnd=%s", args.selection_file, args.hwnd)
 
     if stop_if_running():
         return 0
 
-    if not args.hwnd:
-        logger.error("No HWND provided.")
-        return 1
+    text = ""
+    has_selection = False
 
-    try:
-        text, has_selection = get_document_text_from_edge(args.hwnd)
-        logger.info("UIA mode: %d chars, has_selection=%s", len(text), has_selection)
-    except Exception as exc:
-        logger.exception("Document text extraction failed: %s", exc)
-        tray_tip("win-voice", "Could not read page text from Edge. Please select text and press Alt+1.")
-        return 2
+    if args.selection_file and args.selection_file.exists():
+        raw = args.selection_file.read_text("utf-8", errors="replace")
+        text = clean_text(raw)
+        logger.info("Selection-file mode: %d chars.", len(text))
+        has_selection = True
+    elif args.hwnd:
+        try:
+            text, has_selection = get_document_text_from_edge(args.hwnd)
+            logger.info("UIA mode: %d chars, has_selection=%s", len(text), has_selection)
+        except Exception as exc:
+            logger.exception("Document text extraction failed: %s", exc)
+            return 2
+    else:
+        logger.error("No selection file and no HWND provided.")
+        return 1
 
     if not text:
         if has_selection:
@@ -340,7 +323,6 @@ def main():
             return 0
         else:
             logger.info("No text found on page; may be an image-based PDF.")
-            tray_tip("win-voice", "No readable text found. Please select text and press Alt+1.")
             return 3
 
     if len(text) > MAX_CHARS:
