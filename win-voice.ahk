@@ -4,7 +4,7 @@ SendMode "Input"
 SetWorkingDir A_ScriptDir
 
 ; ============================================================
-; win-voice.ahk  —  Minimal launcher, no clipboard, uses RunWait
+; win-voice.ahk  —  Minimal launcher using Format() for clean quoting
 ; Hotkey: Alt+1
 ; Exit codes from Python:
 ;   0 = success (TTS started or stop signal sent)
@@ -33,7 +33,8 @@ SetWorkingDir A_ScriptDir
     }
 
     hwnd := WinGetID("A")
-    cmd := "`""" . pythonExe . "`"" `""" . scriptPath . "`"" --hwnd " . hwnd
+    ; Use Format with single-quoted format string to avoid quote-escaping hell
+    cmd := Format('"{1}" "{2}" --hwnd {3}', pythonExe, scriptPath, hwnd)
 
     exitCode := RunWait(cmd,, "Hide")
 
