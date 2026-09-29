@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-win_voice.py
-Direct document text extraction from Edge via UI Automation TextPattern.
-No URL fetching, no address bar detection.
+win_voice.py v9
+Read aloud selected text from Edge, Chrome, Notepad, and Notepad++.
+Uses Piper TTS + sounddevice for direct PCM streaming.
 """
 
 import sys
@@ -44,7 +44,6 @@ try:
 
     import numpy as np
     import sounddevice as sd
-    import uiautomation as uia
     logger.info("All imports successful.")
 except Exception as import_exc:
     logger.exception("IMPORT FAILURE: %s", import_exc)
@@ -93,9 +92,6 @@ def get_sample_rate() -> int:
 
 
 def sanitize_for_piper(text: str) -> str:
-    """
-    Remove or replace characters that cause Piper to fail or produce weird sounds.
-    """
     replacements = {
         '\u00A0': ' ',
         '\u200B': '',
@@ -201,21 +197,21 @@ def speak_text(text: str) -> int:
 
 
 # ============================================================
-# Text extraction via UI Automation TextPattern
+# Text extraction helpers
 # ============================================================
 def clean_text(text: str) -> str:
-    text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
-    """
-    Returns (text, has_selection).
-    If extraction fails completely, raises Exception.
-    """
-    logger.info("Connecting to Edge window HWND=%d", hwnd)
+# ============================================================
+# Edge / Chrome: DocumentControl + TextPattern
+# ============================================================
+def get_browser_selection(hwnd: int) -> str:
+    import uiautomation as uia
+
+    logger.info("Connecting to browser window HWND=%d", hwnd)
     window = uia.ControlFromHandle(hwnd)
     if not window:
         raise RuntimeError("uiautomation could not get control from HWND.")
@@ -256,11 +252,7 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
 
     target = doc_control or text_control
     if not target:
-        logger.error("No DocumentControl or TextPattern control found.")
-        for child in window.GetChildren():
-            logger.debug("  child: type=%s name=%s id=%s",
-                         child.ControlTypeName, child.Name, child.AutomationId)
-        raise RuntimeError("No document or text control found in Edge window.")
+        raise RuntimeError("No document or text control found in browser window.")
 
     text_pattern = target.GetTextPattern()
     if not text_pattern:
@@ -274,14 +266,130 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
             if txt:
                 selected_texts.append(txt)
         if selected_texts:
-            full_selection = "\n".join(selected_texts)
-            logger.info("Selection detected: %d chars", len(full_selection))
-            return clean_text(full_selection), True
+            return clean_text("\n".join(selected_texts))
 
-    doc_range = text_pattern.DocumentRange()
-    full_text = doc_range.GetText(MAX_CHARS)
-    logger.info("Full document text: %d chars", len(full_text))
-    return clean_text(full_text), False
+    return ""
+
+
+# ============================================================
+# Notepad: EditControl
+# ============================================================
+def get_notepad_selection(hwnd: int) -> str:
+    import uiautomation as uia
+
+    logger.info("Connecting to Notepad window HWND=%d", hwnd)
+    window = uia.ControlFromHandle(hwnd)
+    if not window:
+        raise RuntimeError("uiautomation could not get control from HWND.")
+
+    edit = None
+    def find_edit(control, max_depth=5, depth=0):
+        nonlocal edit
+        if depth > max_depth or edit:
+            return
+        for child in control.GetChildren():
+            if child.ControlTypeName == "EditControl":
+                edit = child
+                return
+            find_edit(child, max_depth, depth + 1)
+
+    find_edit(window)
+    if not edit:
+        raise RuntimeError("No EditControl found in Notepad window.")
+
+    logger.info("Found EditControl: name=%s", edit.Name)
+
+    text_pattern = edit.GetTextPattern()
+    if text_pattern:
+        selections = text_pattern.GetSelection()
+        if selections:
+            selected_texts = [sel.GetText(-1) for sel in selections if sel.GetText(-1)]
+            if selected_texts:
+                return clean_text("\n".join(selected_texts))
+
+    # Fallback to ValuePattern
+    value_pattern = edit.GetValuePattern()
+    if value_pattern:
+        full = value_pattern.Value
+        if full:
+            logger.info("ValuePattern fallback: %d chars", len(full))
+
+    return ""
+
+
+# ============================================================
+# Notepad++: Scintilla API via SendMessage
+# ============================================================
+# Scintilla constants
+SCI_GETSELECTIONS = 2579
+SCI_GETSELTEXT = 2161
+SCI_GETCURRENTPOS = 2008
+SCI_GETANCHOR = 2009
+SCI_GETLENGTH = 2006
+SCI_GETTEXT = 2182
+
+WM_USER = 1024
+
+
+def send_message(hwnd: int, msg: int, wparam: int = 0, lparam: int = 0) -> int:
+    user32 = ctypes.windll.user32
+    return user32.SendMessageW(hwnd, msg, wparam, lparam)
+
+
+def get_notepad_plus_plus_selection(hwnd: int) -> str:
+    """
+    Uses Scintilla API via SendMessage.
+    hwnd is the main Notepad++ window handle.
+    We find the Scintilla editor child window first.
+    """
+    logger.info("Connecting to Notepad++ window HWND=%d", hwnd)
+
+    # Find the Scintilla editor window
+    scintilla_hwnd = None
+    EnumChildWindows = ctypes.windll.user32.EnumChildWindows
+
+    found_hwnd = ctypes.c_long(0)
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_long, ctypes.c_long)
+    def enum_child_callback(child_hwnd, extra):
+        nonlocal found_hwnd
+        class_name = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(child_hwnd, class_name, 256)
+        if class_name.value == "Scintilla":
+            found_hwnd.value = child_hwnd
+            return False  # stop enumerating
+        return True
+
+    EnumChildWindows(hwnd, enum_child_callback, 0)
+
+    if found_hwnd.value == 0:
+        raise RuntimeError("No Scintilla editor window found in Notepad++.")
+
+    sci_hwnd = found_hwnd.value
+    logger.info("Found Scintilla editor HWND=%d", sci_hwnd)
+
+    # Check if there is a real selection (anchor != current pos)
+    anchor = send_message(sci_hwnd, SCI_GETANCHOR, 0, 0)
+    current_pos = send_message(sci_hwnd, SCI_GETCURRENTPOS, 0, 0)
+    logger.info("anchor=%d current_pos=%d", anchor, current_pos)
+
+    if anchor == current_pos:
+        logger.info("No selection detected (anchor == current_pos).")
+        return ""
+
+    # Get selection text
+    # SCI_GETSELTEXT: wParam=0, lParam=buffer
+    # First get length
+    sel_len = send_message(sci_hwnd, SCI_GETSELTEXT, 0, 0)
+    if sel_len <= 1:  # includes null terminator
+        logger.info("Selection length too small: %d", sel_len)
+        return ""
+
+    buf = ctypes.create_string_buffer(sel_len)
+    send_message(sci_hwnd, SCI_GETSELTEXT, 0, ctypes.addressof(buf))
+    text = buf.raw[:sel_len - 1].decode("utf-8", errors="replace")
+    logger.info("Notepad++ selection: %d chars", len(text))
+    return clean_text(text)
 
 
 # ============================================================
@@ -289,41 +397,39 @@ def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--app", required=True, choices=["edge", "chrome", "notepad", "notepad++"])
+    parser.add_argument("--hwnd", type=int, required=True)
     parser.add_argument("--selection-file", type=Path, default=None)
-    parser.add_argument("--hwnd", type=int, default=0)
     args = parser.parse_args()
 
-    logger.info("Args: selection-file=%s hwnd=%s", args.selection_file, args.hwnd)
+    logger.info("Args: app=%s hwnd=%d selection-file=%s", args.app, args.hwnd, args.selection_file)
 
     if stop_if_running():
         return 0
 
     text = ""
-    has_selection = False
 
+    # Priority 1: use clipboard selection file if AHK detected one
     if args.selection_file and args.selection_file.exists():
         raw = args.selection_file.read_text("utf-8", errors="replace")
         text = clean_text(raw)
-        logger.info("Selection-file mode: %d chars.", len(text))
-        has_selection = True
-    elif args.hwnd:
-        try:
-            text, has_selection = get_document_text_from_edge(args.hwnd)
-            logger.info("UIA mode: %d chars, has_selection=%s", len(text), has_selection)
-        except Exception as exc:
-            logger.exception("Document text extraction failed: %s", exc)
-            return 2
+        logger.info("Clipboard selection mode: %d chars.", len(text))
     else:
-        logger.error("No selection file and no HWND provided.")
-        return 1
+        # Priority 2: app-specific extraction
+        try:
+            if args.app in ("edge", "chrome"):
+                text = get_browser_selection(args.hwnd)
+            elif args.app == "notepad":
+                text = get_notepad_selection(args.hwnd)
+            elif args.app == "notepad++":
+                text = get_notepad_plus_plus_selection(args.hwnd)
+        except Exception as exc:
+            logger.exception("Text extraction failed for %s: %s", args.app, exc)
+            return 2
 
     if not text:
-        if has_selection:
-            logger.info("Selection was empty; exiting.")
-            return 0
-        else:
-            logger.info("No text found on page; may be an image-based PDF.")
-            return 3
+        logger.info("No text selected.")
+        return 3
 
     if len(text) > MAX_CHARS:
         text = text[:MAX_CHARS]

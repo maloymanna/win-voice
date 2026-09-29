@@ -1,6 +1,6 @@
 # win-voice
 
-Read aloud text from Microsoft Edge (webpages and selected text) using Piper TTS and sounddevice.
+Read aloud selected text from Microsoft Edge, Google Chrome, Notepad, and Notepad++ using Piper TTS and sounddevice.
 
 ## Requirements
 
@@ -8,12 +8,12 @@ Read aloud text from Microsoft Edge (webpages and selected text) using Piper TTS
 - Python 3.14 installed at `C:\Program Files\Python314\python.exe`
 - AutoHotkey v2
 - Piper TTS with a voice model (e.g. `en_US-lessac-medium.onnx`)
-- Python packages: `sounddevice`, `numpy`, `uiautomation`
+- Python packages: `sounddevice`, `numpy`
 
 Install dependencies:
 
 ```powershell
-python -m pip install sounddevice numpy uiautomation
+python -m pip install sounddevice numpy
 ```
 
 ## Installation
@@ -30,19 +30,26 @@ python -m pip install sounddevice numpy uiautomation
 
 | Action | Result |
 |--------|--------|
-| `Alt + 1` in Edge with text selected | Reads the selected text |
-| `Alt + 1` in Edge with no selection | Reads the current webpage (up to 50 KB of text) |
+| `Alt + 1` with text selected | Reads the selected text |
+| `Alt + 1` with no text selected | Tray notification: "No text selected. Please select text and press Alt+1." |
 | `Alt + 1` while audio is playing | Stops playback immediately |
-| `Alt + 1` in any other window | Tray notification: "Alt-1 pressed but Edge not active" |
+| `Alt + 1` in an unsupported app | Tray notification: "Alt-1 pressed but no supported app is active" |
+
+**Supported applications:** Microsoft Edge, Google Chrome, Notepad, Notepad++
 
 ## Files
 
-- `win-voice.ahk` — Minimal AutoHotkey v2 launcher. Detects Edge, captures selection, invokes Python.
-- `win_voice.py` — Python worker. Extracts text via UI Automation, runs Piper, streams audio via sounddevice.
+- `win-voice.ahk` — Minimal AutoHotkey v2 launcher. Detects supported apps, captures selection, invokes Python.
+- `win_voice.py` — Python worker. Sanitizes text, runs Piper, streams audio via sounddevice.
 - `win_voice.log` — Debug log created on every run in the same folder.
+
+## Notes
+
+- **Notepad++:** The script uses the Scintilla API to verify a true text selection is present. This avoids reading the current line when no text is actually selected (if Notepad++'s "Copy current line" feature is enabled).
+- **Character limit:** Selections longer than 50,000 characters are truncated before speaking.
 
 ## Troubleshooting
 
-- **No sound**: Check `win_voice.log` for Piper or sounddevice errors.
-- **"Could not read page text"**: The page may be an image-based PDF. Select text manually and press `Alt + 1` again.
-- **Piper errors**: Verify the voice model path in `win_voice.py` matches your actual `.onnx` and `.json` files.
+- **No sound:** Check `win_voice.log` for Piper or sounddevice errors.
+- **"An error occurred":** Check `win_voice.log` for details.
+- **Piper errors:** Verify the voice model path in `win_voice.py` matches your actual `.onnx` and `.json` files.
