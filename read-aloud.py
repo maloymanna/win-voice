@@ -351,11 +351,12 @@ def speak_text(text, label="Reading aloud"):
             pass
 
     # Run piper to generate WAV
+    # NOTE: Windows piper uses --input_file, not --file
     piper_cmd = [
         PIPER_BIN,
         "--model",
         PIPER_VOICE,
-        "--file",
+        "--input_file",
         text_path,
         "--output_file",
         wav_path,
