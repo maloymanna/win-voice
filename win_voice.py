@@ -307,13 +307,6 @@ def get_notepad_selection(hwnd: int) -> str:
             if selected_texts:
                 return clean_text("\n".join(selected_texts))
 
-    # Fallback to ValuePattern
-    value_pattern = edit.GetValuePattern()
-    if value_pattern:
-        full = value_pattern.Value
-        if full:
-            logger.info("ValuePattern fallback: %d chars", len(full))
-
     return ""
 
 
@@ -344,8 +337,6 @@ def get_notepad_plus_plus_selection(hwnd: int) -> str:
     """
     logger.info("Connecting to Notepad++ window HWND=%d", hwnd)
 
-    # Find the Scintilla editor window
-    scintilla_hwnd = None
     EnumChildWindows = ctypes.windll.user32.EnumChildWindows
 
     found_hwnd = ctypes.c_long(0)
@@ -378,8 +369,6 @@ def get_notepad_plus_plus_selection(hwnd: int) -> str:
         return ""
 
     # Get selection text
-    # SCI_GETSELTEXT: wParam=0, lParam=buffer
-    # First get length
     sel_len = send_message(sci_hwnd, SCI_GETSELTEXT, 0, 0)
     if sel_len <= 1:  # includes null terminator
         logger.info("Selection length too small: %d", sel_len)

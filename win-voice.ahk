@@ -4,7 +4,9 @@ SendMode "Input"
 SetWorkingDir A_ScriptDir
 
 ; ============================================================
-; win-voice.ahk  —  Alt+1 text-to-speech for Edge, Chrome, Notepad, Notepad++
+; win-voice.ahk  —  Alt+1 text-to-speech
+; Supports: Edge, Chrome, Notepad, Notepad++
+; Reads selected text only. Shows notification if nothing selected.
 ; ============================================================
 
 !1:: {
@@ -28,7 +30,24 @@ SetWorkingDir A_ScriptDir
         return
     }
 
-    ; ---- Capture selection via clipboard ----
+    hwnd := WinGetID("A")
+    appName := StrReplace(procName, ".exe", "")
+
+    ; ---- Notepad++: skip clipboard, let Python use Scintilla API ----
+    if (appName == "notepad++") {
+        cmd := Format('"{1}" "{2}" --app notepad++ --hwnd {3}', pythonExe, scriptPath, hwnd)
+        exitCode := RunWait(cmd,, "Hide")
+        if (exitCode == 3) {
+            TrayTip "No text selected. Please select text and press Alt+1.", "win-voice"
+        } else if (exitCode == 2) {
+            TrayTip "Could not read text. Please select text and press Alt+1.", "win-voice"
+        } else if (exitCode != 0) {
+            TrayTip "An error occurred. Check win_voice.log for details.", "win-voice"
+        }
+        return
+    }
+
+    ; ---- All other apps: capture selection via clipboard ----
     ClipSaved := ClipboardAll()
     A_Clipboard := ""
     Sleep(50)
@@ -46,9 +65,6 @@ SetWorkingDir A_ScriptDir
 
     A_Clipboard := ClipSaved
     ClipSaved := ""
-
-    hwnd := WinGetID("A")
-    appName := StrReplace(procName, ".exe", "")
 
     cmd := Format('"{1}" "{2}" --app {3} --hwnd {4}', pythonExe, scriptPath, appName, hwnd)
     if (hasText) {
