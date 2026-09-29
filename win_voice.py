@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 win_voice.py
-Reads selected text or current page content from Edge and speaks it via Piper + sounddevice.
+Direct document text extraction from Edge via UI Automation TextPattern.
+No URL fetching, no address bar detection, no clipboard manipulation.
 """
 
 import sys
@@ -40,19 +41,20 @@ try:
     import re
     import subprocess
     import time
-    import urllib.parse
-    import urllib.request
     import html
-    from html.parser import HTMLParser
 
     import numpy as np
-    import requests
     import sounddevice as sd
     import uiautomation as uia
     logger.info("All imports successful.")
 except Exception as import_exc:
     logger.exception("IMPORT FAILURE: %s", import_exc)
-    ctypes.windll.user32.MessageBoxW(0, f"Import error — check win_voice.log\n\n{import_exc}", "win_voice import error", 0x10)
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        f"Import error — check win_voice.log\n\n{import_exc}",
+        "win_voice import error",
+        0x10
+    )
     sys.exit(1)
 
 # ============================================================
@@ -62,8 +64,7 @@ PIPER_EXE = Path(r"C:\Users\myuser\AppData\Roaming\Python\Python314\Scripts\pipe
 VOICE_PATH = Path(r"C:\Users\myuser\pipervoices\en_US-lessac-medium.onnx")
 VOICE_JSON = Path(str(VOICE_PATH) + ".json")
 
-HARD_LIMIT_BYTES = 50 * 1024  # 50 KB raw limit for webpages
-MAX_CHARS = 20000
+MAX_CHARS = 50000  # Hard safety limit on spoken text (~50KB equivalent)
 
 # ============================================================
 # Stop toggle
@@ -155,41 +156,10 @@ def speak_text(text: str) -> None:
         PID_FILE.unlink(missing_ok=True)
         logger.info("Playback finished.")
 
+
 # ============================================================
-# Text extraction helpers
+# Text extraction via UI Automation TextPattern
 # ============================================================
-class HTMLTextExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts = []
-        self.skip_tags = {"script", "style", "nav", "footer", "header", "aside"}
-        self.in_skip = 0
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self.skip_tags:
-            self.in_skip += 1
-        if tag == "br":
-            self.parts.append("\n")
-        if tag in ("p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"):
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag):
-        if tag in self.skip_tags:
-            self.in_skip -= 1
-        if tag in ("p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"):
-            self.parts.append("\n")
-
-    def handle_data(self, data):
-        if self.in_skip <= 0:
-            self.parts.append(data)
-
-    def get_text(self) -> str:
-        text = "".join(self.parts)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
-
-
 def clean_text(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -197,151 +167,83 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# ============================================================
-# URL / Content fetching
-# ============================================================
-def get_edge_url(hwnd: int) -> str | None:
-    logger.info("Resolving URL from Edge HWND=%d", hwnd)
-    try:
-        window = uia.ControlFromHandle(hwnd)
-        if not window:
-            logger.error("uiautomation could not get control from HWND.")
-            return None
+def get_document_text_from_edge(hwnd: int) -> tuple[str, bool]:
+    """
+    Returns (text, has_selection).
+    If extraction fails completely, raises Exception.
+    """
+    logger.info("Connecting to Edge window HWND=%d", hwnd)
+    window = uia.ControlFromHandle(hwnd)
+    if not window:
+        raise RuntimeError("uiautomation could not get control from HWND.")
 
-        address_bar = None
+    logger.info("Window name=%s class=%s", window.Name, window.ClassName)
 
-        def find_by_id(control, ids, max_depth=6, depth=0):
-            if depth > max_depth:
-                return None
+    # Strategy 1: Find DocumentControl directly
+    doc_control = None
+    def find_doc(control, max_depth=8, depth=0):
+        nonlocal doc_control
+        if depth > max_depth or doc_control:
+            return
+        for child in control.GetChildren():
+            if child.ControlTypeName == "DocumentControl":
+                doc_control = child
+                return
+            find_doc(child, max_depth, depth + 1)
+
+    find_doc(window)
+    if doc_control:
+        logger.info("Found DocumentControl: name=%s", doc_control.Name)
+
+    # Strategy 2: Find any control that supports TextPattern
+    text_control = None
+    if not doc_control:
+        def find_text_pattern(control, max_depth=8, depth=0):
+            nonlocal text_control
+            if depth > max_depth or text_control:
+                return
             for child in control.GetChildren():
-                if child.AutomationId in ids:
-                    return child
-                result = find_by_id(child, ids, max_depth, depth + 1)
-                if result:
-                    return result
-            return None
+                if child.GetTextPattern():
+                    text_control = child
+                    return
+                find_text_pattern(child, max_depth, depth + 1)
 
-        address_bar = find_by_id(window, ("view_1002", "AddressBar", "addressEdit"))
-        if address_bar:
-            logger.info("Found address bar by AutomationId=%s", address_bar.AutomationId)
+        find_text_pattern(window)
+        if text_control:
+            logger.info("Found control with TextPattern: type=%s name=%s",
+                        text_control.ControlTypeName, text_control.Name)
 
-        if not address_bar:
-            def find_by_name(control, max_depth=6, depth=0):
-                if depth > max_depth:
-                    return None
-                for child in control.GetChildren():
-                    if child.ControlTypeName in ("EditControl", "DocumentControl"):
-                        name = child.Name or ""
-                        if any(k in name for k in ("Address", "アドレス", "地址", "search", "検索", "搜索")):
-                            return child
-                    result = find_by_name(child, max_depth, depth + 1)
-                    if result:
-                        return result
-                return None
+    target = doc_control or text_control
+    if not target:
+        # Debug: log top-level children
+        logger.error("No DocumentControl or TextPattern control found.")
+        for child in window.GetChildren():
+            logger.debug("  child: type=%s name=%s id=%s",
+                         child.ControlTypeName, child.Name, child.AutomationId)
+        raise RuntimeError("No document or text control found in Edge window.")
 
-            address_bar = find_by_name(window)
-            if address_bar:
-                logger.info("Found address bar by Name=%s", address_bar.Name)
+    text_pattern = target.GetTextPattern()
+    if not text_pattern:
+        raise RuntimeError("Target control does not expose TextPattern.")
 
-        if not address_bar:
-            def find_by_url_value(control, max_depth=6, depth=0):
-                if depth > max_depth:
-                    return None
-                for child in control.GetChildren():
-                    if child.ControlTypeName == "EditControl":
-                        val_pat = child.GetValuePattern()
-                        if val_pat:
-                            val = val_pat.Value or ""
-                            if val.startswith("http") or val.startswith("file:") or "://" in val:
-                                return child
-                    result = find_by_url_value(child, max_depth, depth + 1)
-                    if result:
-                        return result
-                return None
+    # Check for selection first
+    selections = text_pattern.GetSelection()
+    if selections:
+        selected_texts = []
+        for sel in selections:
+            txt = sel.GetText(-1)
+            if txt:
+                selected_texts.append(txt)
+        if selected_texts:
+            full_selection = "\n".join(selected_texts)
+            logger.info("Selection detected: %d chars", len(full_selection))
+            return clean_text(full_selection), True
 
-            address_bar = find_by_url_value(window)
-            if address_bar:
-                logger.info("Found address bar by URL-like value")
-
-        if not address_bar:
-            logger.error("Could not find Edge address bar in UIA tree.")
-            for child in window.GetChildren():
-                logger.debug("  child: type=%s name=%s id=%s", child.ControlTypeName, child.Name, child.AutomationId)
-            return None
-
-        val_pat = address_bar.GetValuePattern()
-        url = val_pat.Value if val_pat else address_bar.Name
-        logger.info("Resolved URL: %s", url)
-        return url
-    except Exception as exc:
-        logger.exception("UI Automation failed: %s", exc)
-        return None
-
-
-def is_pdf_url(url: str) -> bool:
-    """Detect PDF from URL suffix or HEAD request without downloading body."""
-    parsed = urllib.parse.urlparse(url)
-    path = parsed.path.lower()
-    if path.endswith(".pdf"):
-        logger.info("PDF detected by URL suffix: %s", url)
-        return True
-
-    # For HTTP(S), try a HEAD request to check Content-Type
-    if parsed.scheme in ("http", "https"):
-        try:
-            resp = requests.head(url, timeout=5, allow_redirects=True)
-            ct = resp.headers.get("Content-Type", "").lower()
-            if "pdf" in ct:
-                logger.info("PDF detected by Content-Type: %s", ct)
-                return True
-        except Exception as exc:
-            logger.debug("HEAD request failed (%s); assuming not PDF.", exc)
-    return False
-
-
-def fetch_webpage_text(url: str) -> str:
-    """Fetch up to 50KB of raw HTML and convert to plain text."""
-    logger.info("Fetching webpage up to %d bytes from %s", HARD_LIMIT_BYTES, url)
-    parsed = urllib.parse.urlparse(url)
-
-    if parsed.scheme in ("http", "https"):
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.0 Edg/128.0.0.0"
-            )
-        }
-        resp = requests.get(url, headers=headers, stream=True, timeout=20)
-        resp.raise_for_status()
-        data = b""
-        for chunk in resp.iter_content(chunk_size=8192):
-            data += chunk
-            if len(data) >= HARD_LIMIT_BYTES:
-                break
-        data = data[:HARD_LIMIT_BYTES]
-    elif parsed.scheme == "file":
-        path = urllib.request.url2pathname(parsed.path)
-        with open(path, "rb") as f:
-            data = f.read(HARD_LIMIT_BYTES)
-    elif os.path.exists(url):
-        with open(url, "rb") as f:
-            data = f.read(HARD_LIMIT_BYTES)
-    else:
-        raise ValueError(f"Unsupported URL scheme or missing file: {url}")
-
-    if not data:
-        return ""
-
-    try:
-        html_str = data.decode("utf-8", errors="replace")
-    except UnicodeDecodeError:
-        html_str = data.decode("latin-1", errors="replace")
-
-    extractor = HTMLTextExtractor()
-    extractor.feed(html_str)
-    text = extractor.get_text()
-    return clean_text(text)
+    # No selection: get full document text
+    doc_range = text_pattern.DocumentRange()
+    full_text = doc_range.GetText(MAX_CHARS)
+    logger.info("Full document text: %d chars", len(full_text))
+    return clean_text(full_text), False
 
 
 # ============================================================
@@ -359,34 +261,44 @@ def main():
         return
 
     text = ""
+    has_selection = False
+
     if args.selection_file and args.selection_file.exists():
+        # Legacy path from AHK clipboard mode (still supported)
         raw = args.selection_file.read_text("utf-8", errors="replace")
         text = clean_text(raw)
-        logger.info("Selection mode: %d chars.", len(text))
+        logger.info("Selection-file mode: %d chars.", len(text))
+        has_selection = True
     elif args.hwnd:
-        url = get_edge_url(args.hwnd)
-        if not url:
-            logger.error("Could not determine Edge URL; aborting.")
-            return
-
-        if is_pdf_url(url):
-            logger.info("PDF detected in page mode. Prompting user to select text.")
+        try:
+            text, has_selection = get_document_text_from_edge(args.hwnd)
+            logger.info("UIA mode: %d chars, has_selection=%s", len(text), has_selection)
+        except Exception as exc:
+            logger.exception("Document text extraction failed: %s", exc)
             ctypes.windll.user32.MessageBoxW(
                 0,
-                "PDF detected.\n\nPlease select the text you want to read and press Alt+1.",
+                "Could not read page text from Edge.\n\n"
+                "Please select the text you want to read and press Alt+1.",
                 "win-voice",
                 0x40  # MB_ICONINFORMATION
             )
             return
-
-        text = fetch_webpage_text(url)
-        logger.info("Page mode: %d chars from %s", len(text), url)
     else:
         logger.error("No selection file and no HWND provided.")
         return
 
     if not text:
-        logger.info("No text to speak; exiting.")
+        if has_selection:
+            logger.info("Selection was empty; exiting.")
+        else:
+            logger.info("No text found on page; may be an image-based PDF. Prompting user.")
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "No readable text found on this page.\n\n"
+                "Please select the text you want to read and press Alt+1.",
+                "win-voice",
+                0x40
+            )
         return
 
     if len(text) > MAX_CHARS:
