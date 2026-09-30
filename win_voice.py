@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-win_voice.py v10
-Read aloud selected text from Edge, Chrome, Notepad, and Notepad++.
+win_voice.py v12
+Read aloud selected text from Edge, Chrome, and Notepad++.
 Uses Piper TTS + sounddevice for direct PCM streaming.
 """
 
@@ -59,6 +59,26 @@ VOICE_JSON = Path(str(VOICE_PATH) + ".json")
 MAX_CHARS = 50000  # Hard safety limit on spoken text
 
 # ============================================================
+# Notification helper (message box from Python)
+# ============================================================
+# Windows MessageBox flags
+MB_OK = 0x00000000
+MB_ICONINFORMATION = 0x00000040
+MB_SETFOREGROUND = 0x00010000
+MB_TOPMOST = 0x00040000
+
+
+def tray_notify(title: str, msg: str) -> None:
+    """Show a topmost information message box."""
+    try:
+        user32 = ctypes.windll.user32
+        flags = MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
+        user32.MessageBoxW(0, msg, title, flags)
+    except Exception as exc:
+        logger.warning("Failed to show notification: %s", exc)
+
+
+# ============================================================
 # Stop toggle
 # ============================================================
 def stop_if_running() -> bool:
@@ -72,6 +92,7 @@ def stop_if_running() -> bool:
             kernel.CloseHandle(handle)
             PID_FILE.unlink()
             logger.info("Stop signal sent to running playback (PID %d).", pid)
+            tray_notify("win-voice", "Playback stopped.")
             return True
     except (ValueError, OSError) as exc:
         logger.warning("Stale PID file (%s); removing.", exc)
@@ -141,6 +162,7 @@ def speak_text(text: str) -> int:
     text = sanitize_for_piper(text)
     if not text:
         logger.warning("Text is empty after sanitization.")
+        tray_notify("win-voice", "No text selected. Please select text and press Alt+1.")
         return 1
 
     logger.info("Speaking %d chars at %d Hz.", len(text), sample_rate)
@@ -272,45 +294,6 @@ def get_browser_selection(hwnd: int) -> str:
 
 
 # ============================================================
-# Notepad: EditControl
-# ============================================================
-def get_notepad_selection(hwnd: int) -> str:
-    import uiautomation as uia
-
-    logger.info("Connecting to Notepad window HWND=%d", hwnd)
-    window = uia.ControlFromHandle(hwnd)
-    if not window:
-        raise RuntimeError("uiautomation could not get control from HWND.")
-
-    edit = None
-    def find_edit(control, max_depth=5, depth=0):
-        nonlocal edit
-        if depth > max_depth or edit:
-            return
-        for child in control.GetChildren():
-            if child.ControlTypeName == "EditControl":
-                edit = child
-                return
-            find_edit(child, max_depth, depth + 1)
-
-    find_edit(window)
-    if not edit:
-        raise RuntimeError("No EditControl found in Notepad window.")
-
-    logger.info("Found EditControl: name=%s", edit.Name)
-
-    text_pattern = edit.GetTextPattern()
-    if text_pattern:
-        selections = text_pattern.GetSelection()
-        if selections:
-            selected_texts = [sel.GetText(-1) for sel in selections if sel.GetText(-1)]
-            if selected_texts:
-                return clean_text("\n".join(selected_texts))
-
-    return ""
-
-
-# ============================================================
 # Notepad++: Scintilla API via SendMessage
 # ============================================================
 # Scintilla constants
@@ -380,7 +363,7 @@ def get_notepad_plus_plus_selection(hwnd: int) -> str:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--app", required=True, choices=["edge", "chrome", "notepad", "notepad++"])
+    parser.add_argument("--app", required=True, choices=["edge", "chrome", "notepad++"])
     parser.add_argument("--hwnd", type=int, required=True)
     parser.add_argument("--selection-file", type=Path, default=None)
     args = parser.parse_args()
@@ -398,13 +381,9 @@ def main():
         text = clean_text(raw)
         logger.info("Clipboard selection mode: %d chars.", len(text))
     else:
-        # Priority 2: app-specific extraction
+        # Priority 2: app-specific extraction (Notepad++ only when no clipboard)
         try:
-            if args.app in ("edge", "chrome"):
-                text = get_browser_selection(args.hwnd)
-            elif args.app == "notepad":
-                text = get_notepad_selection(args.hwnd)
-            elif args.app == "notepad++":
+            if args.app == "notepad++":
                 text = get_notepad_plus_plus_selection(args.hwnd)
         except Exception as exc:
             logger.exception("Text extraction failed for %s: %s", args.app, exc)
@@ -412,6 +391,7 @@ def main():
 
     if not text:
         logger.info("No text selected.")
+        tray_notify("win-voice", "No text selected. Please select text and press Alt+1.")
         return 3
 
     if len(text) > MAX_CHARS:

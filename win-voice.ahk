@@ -4,7 +4,7 @@ SendMode "Input"
 SetWorkingDir A_ScriptDir
 
 ; ============================================================
-; win-voice.ahk v24 — Alt+1 text-to-speech
+; win-voice.ahk v25 — Alt+1 text-to-speech
 ; Supports: Edge, Chrome, Notepad++
 ; Removed: Notepad (UIA EditControl unreliable on Win11)
 ;
@@ -85,11 +85,13 @@ PID_FILE := A_ScriptDir . "\playback.pid"
     A_Clipboard := ClipSaved
     ClipSaved := ""
 
-    ; ---- Build and run Python command (non-blocking) ----
-    cmd := Format('"{1}" "{2}" --app {3} --hwnd {4}', pythonExe, scriptPath, appName, hwnd)
-    if (hasText) {
-        cmd .= Format(' --selection-file "{1}"', selectionFile)
+    ; ---- No text detected: show notification and exit ----
+    if (!hasText) {
+        TrayTip "No text selected. Please select text and press Alt+1.", "win-voice"
+        return
     }
 
+    ; ---- Build and run Python command (non-blocking) ----
+    cmd := Format('"{1}" "{2}" --app {3} --hwnd {4} --selection-file "{5}"', pythonExe, scriptPath, appName, hwnd, selectionFile)
     Run(cmd,, "Hide")
 }
