@@ -4,7 +4,7 @@ SendMode "Input"
 SetWorkingDir A_ScriptDir
 
 ; ============================================================
-; win-voice.ahk v25 — Alt+1 text-to-speech
+; win-voice.ahk v26 — Alt+1 text-to-speech
 ; Supports: Edge, Chrome, Notepad++
 ; Removed: Notepad (UIA EditControl unreliable on Win11)
 ;
@@ -76,7 +76,8 @@ PID_FILE := A_ScriptDir . "\playback.pid"
         clipAvailable := ClipWait(1.0, 1)
     }
 
-    hasText := (clipAvailable && A_Clipboard != "")
+    ; Require at least one non-whitespace character (handles blank lines in Notepad++)
+    hasText := (clipAvailable && RegExMatch(A_Clipboard, "\S"))
 
     if (hasText) {
         FileAppend(A_Clipboard, selectionFile, "UTF-8")

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-win_voice.py v12
+win_voice.py v14
 Read aloud selected text from Edge, Chrome, and Notepad++.
 Uses Piper TTS + sounddevice for direct PCM streaming.
+
+Modes:
+  --selection-file + --app    : Browser mode (clipboard text -> speak)
+  --app notepad++ --hwnd      : Notepad++ mode (Scintilla -> speak)
+  --extract-only <file>       : Extract text only, save to file, exit
+  --speak-only <file>         : Read text from file and speak
 """
 
 import sys
@@ -59,26 +65,6 @@ VOICE_JSON = Path(str(VOICE_PATH) + ".json")
 MAX_CHARS = 50000  # Hard safety limit on spoken text
 
 # ============================================================
-# Notification helper (message box from Python)
-# ============================================================
-# Windows MessageBox flags
-MB_OK = 0x00000000
-MB_ICONINFORMATION = 0x00000040
-MB_SETFOREGROUND = 0x00010000
-MB_TOPMOST = 0x00040000
-
-
-def tray_notify(title: str, msg: str) -> None:
-    """Show a topmost information message box."""
-    try:
-        user32 = ctypes.windll.user32
-        flags = MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
-        user32.MessageBoxW(0, msg, title, flags)
-    except Exception as exc:
-        logger.warning("Failed to show notification: %s", exc)
-
-
-# ============================================================
 # Stop toggle
 # ============================================================
 def stop_if_running() -> bool:
@@ -92,7 +78,6 @@ def stop_if_running() -> bool:
             kernel.CloseHandle(handle)
             PID_FILE.unlink()
             logger.info("Stop signal sent to running playback (PID %d).", pid)
-            tray_notify("win-voice", "Playback stopped.")
             return True
     except (ValueError, OSError) as exc:
         logger.warning("Stale PID file (%s); removing.", exc)
@@ -162,7 +147,6 @@ def speak_text(text: str) -> int:
     text = sanitize_for_piper(text)
     if not text:
         logger.warning("Text is empty after sanitization.")
-        tray_notify("win-voice", "No text selected. Please select text and press Alt+1.")
         return 1
 
     logger.info("Speaking %d chars at %d Hz.", len(text), sample_rate)
@@ -361,37 +345,76 @@ def get_notepad_plus_plus_selection(hwnd: int) -> str:
 # ============================================================
 # Main
 # ============================================================
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--app", required=True, choices=["edge", "chrome", "notepad++"])
-    parser.add_argument("--hwnd", type=int, required=True)
-    parser.add_argument("--selection-file", type=Path, default=None)
-    args = parser.parse_args()
-
-    logger.info("Args: app=%s hwnd=%d selection-file=%s", args.app, args.hwnd, args.selection_file)
-
-    if stop_if_running():
-        return 0
-
+def extract_text(args) -> str:
+    """Extract text based on app and arguments. Returns empty string if none."""
     text = ""
 
-    # Priority 1: use clipboard selection file if AHK detected one
     if args.selection_file and args.selection_file.exists():
         raw = args.selection_file.read_text("utf-8", errors="replace")
         text = clean_text(raw)
         logger.info("Clipboard selection mode: %d chars.", len(text))
-    else:
-        # Priority 2: app-specific extraction (Notepad++ only when no clipboard)
+    elif args.app == "notepad++":
         try:
-            if args.app == "notepad++":
-                text = get_notepad_plus_plus_selection(args.hwnd)
+            text = get_notepad_plus_plus_selection(args.hwnd)
         except Exception as exc:
-            logger.exception("Text extraction failed for %s: %s", args.app, exc)
+            logger.exception("Text extraction failed for Notepad++: %s", exc)
+            raise
+
+    return text
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--app", choices=["edge", "chrome", "notepad++"])
+    parser.add_argument("--hwnd", type=int, default=0)
+    parser.add_argument("--selection-file", type=Path, default=None)
+    parser.add_argument("--extract-only", type=Path, default=None, help="Extract text and save to file, then exit")
+    parser.add_argument("--speak-only", type=Path, default=None, help="Read text from file and speak")
+    args = parser.parse_args()
+
+    logger.info("Args: app=%s hwnd=%d selection-file=%s extract-only=%s speak-only=%s",
+                args.app, args.hwnd, args.selection_file, args.extract_only, args.speak_only)
+
+    # ---- Mode: speak-only ----
+    if args.speak_only:
+        if stop_if_running():
+            return 0
+        if not args.speak_only.exists():
+            logger.error("Speak file not found: %s", args.speak_only)
+            return 1
+        text = args.speak_only.read_text("utf-8", errors="replace")
+        text = clean_text(text)
+        if not text:
+            logger.warning("Speak file is empty.")
+            return 1
+        if len(text) > MAX_CHARS:
+            text = text[:MAX_CHARS]
+        return speak_text(text)
+
+    # ---- Mode: extract-only ----
+    if args.extract_only:
+        try:
+            text = extract_text(args)
+        except Exception:
             return 2
+        if not text:
+            logger.info("No text selected.")
+            return 3
+        args.extract_only.write_text(text, encoding="utf-8")
+        logger.info("Extracted %d chars to %s", len(text), args.extract_only)
+        return 0
+
+    # ---- Mode: normal (extract + speak in one shot) ----
+    if stop_if_running():
+        return 0
+
+    try:
+        text = extract_text(args)
+    except Exception:
+        return 2
 
     if not text:
         logger.info("No text selected.")
-        tray_notify("win-voice", "No text selected. Please select text and press Alt+1.")
         return 3
 
     if len(text) > MAX_CHARS:
