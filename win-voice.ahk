@@ -4,11 +4,15 @@ SendMode "Input"
 SetWorkingDir A_ScriptDir
 
 ; ============================================================
-; win-voice.ahk v23 — Alt+1 text-to-speech
-; Supports: Edge, Chrome, Notepad, Notepad++
+; win-voice.ahk v24 — Alt+1 text-to-speech
+; Supports: Edge, Chrome, Notepad++
+; Removed: Notepad (UIA EditControl unreliable on Win11)
 ;
 ; Stop toggle: pressing Alt+1 during playback deletes the
 ; playback.pid file; Python detects this and stops audio.
+;
+; Focus fix: after stop toggle, sends {Alt Up} and {Esc}
+; to prevent browser menubar focus glitch.
 ; ============================================================
 
 PID_FILE := A_ScriptDir . "\playback.pid"
@@ -18,6 +22,10 @@ PID_FILE := A_ScriptDir . "\playback.pid"
     if (FileExist(PID_FILE)) {
         FileDelete(PID_FILE)
         Sleep(100)
+        ; Prevent browser from keeping Alt focus on "3 dots" menu
+        Send "{Alt Up}"
+        Sleep(50)
+        Send "{Esc}"
         return
     }
 
@@ -28,8 +36,6 @@ PID_FILE := A_ScriptDir . "\playback.pid"
         appName := "edge"
     } else if (procName ~= "i)^chrome\.exe$") {
         appName := "chrome"
-    } else if (procName ~= "i)^notepad\.exe$") {
-        appName := "notepad"
     } else if (procName ~= "i)^notepad\+\+\.exe$") {
         appName := "notepad++"
     } else {
